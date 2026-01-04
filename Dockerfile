@@ -13,4 +13,4 @@ COPY . .
 RUN mkdir -p /app/data /app/logs
 
 # Run the bot with arbitrage strategy
-CMD ["python", "-m", "cli.main", "run", "--strategy", "arbitrage", "--interval", "60"]
+CMD ["python", "-m", "cli.main", "run", "--strategy", "all", "--interval", "60"]
