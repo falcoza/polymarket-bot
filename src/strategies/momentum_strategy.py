@@ -44,7 +44,7 @@ class MomentumStrategy(BaseStrategy):
             settings.momentum_threshold,
         )
         self.volume_spike_threshold = self.get_config("volume_spike_threshold", 2.0)
-        self.min_data_points = self.get_config("min_data_points", 6)
+        self.min_data_points = self.get_config("min_data_points", 3)
 
         # Technical indicators config
         self.rsi_oversold = self.get_config("rsi_oversold", 30)
