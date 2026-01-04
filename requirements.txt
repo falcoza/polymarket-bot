@@ -1,0 +1,15 @@
+# Core dependencies
+py-clob-client>=0.17.0
+anthropic>=0.18.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+httpx>=0.25.0
+typer>=0.9.0
+rich>=13.0.0
+python-dotenv>=1.0.0
+
+# Development dependencies (optional)
+# pytest>=7.0.0
+# pytest-asyncio>=0.21.0
+# black>=23.0.0
+# ruff>=0.1.0
