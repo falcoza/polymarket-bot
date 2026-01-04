@@ -47,9 +47,9 @@ htmlcov/
 # Mypy
 .mypy_cache/
 
-# Data and logs
-data/
-logs/
+# Data and logs (top-level only, not src/data/)
+/data/
+/logs/
 *.db
 *.sqlite
 *.sqlite3
