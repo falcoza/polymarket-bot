@@ -858,22 +858,22 @@ async def _scan_async(
     detector = WhaleDetector(settings, activity_client)
     detector.min_bet_usd = min_bet
 
-    # Telegram and copy trading setup
+    # Copy trading setup (always enabled for auto paper trading)
+    from src.scanner.copy_trader import CopyTrader
+    copy_trader = CopyTrader(settings)
+    copy_trader.max_position_usd = copy_size
+
+    # Telegram setup (optional)
     telegram_bot = None
-    copy_trader = None
 
     if use_telegram:
         from src.scanner.telegram_bot import TelegramAlertBot
-        from src.scanner.copy_trader import CopyTrader
 
         telegram_bot = TelegramAlertBot(settings)
         telegram_bot.max_copy_size = copy_size
 
         if await telegram_bot.initialize():
-            copy_trader = CopyTrader(settings)
-            copy_trader.max_position_usd = copy_size
-
-            # Set copy callback
+            # Set copy callback for manual telegram button clicks
             telegram_bot.set_copy_callback(copy_trader.execute_copy)
 
             # Start polling for button clicks
@@ -887,7 +887,7 @@ async def _scan_async(
     console.print(f"  Min bet: ${min_bet:,.0f}")
     console.print(f"  Interval: {interval}s")
     console.print(f"  Telegram: {'✓' if telegram_bot else '✗'}")
-    console.print(f"  Copy size: ${copy_size:.0f}")
+    console.print(f"  Auto paper trade: ✓ (${copy_size:.0f} per whale)")
     console.print(f"  Press Ctrl+C to stop\n")
 
     iteration = 0
@@ -907,6 +907,13 @@ async def _scan_async(
                     for alert in alerts:
                         # Always print to console
                         console.print(alert.format_console())
+
+                        # Auto paper trade on every whale detected
+                        success = await copy_trader.execute_copy(alert, copy_size)
+                        if success:
+                            console.print(f"[green]  → Paper trade executed: ${copy_size:.2f}[/green]")
+                        else:
+                            console.print(f"[red]  → Paper trade failed[/red]")
 
                         # Send to Telegram if enabled
                         if telegram_bot:
