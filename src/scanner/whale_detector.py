@@ -33,9 +33,23 @@ class WhaleDetector:
         self.max_trade_age_hours = 5  # Only alert on trades < 5 hours old
         self.repeat_pattern_threshold = 3  # Trades in same category
 
+        # Resolution timing thresholds
+        self.imminent_resolution_hours = 6  # < 6 hours = imminent
+        self.soon_resolution_hours = 24  # < 24 hours = soon
+        self.near_resolution_hours = 72  # < 72 hours = near
+
+        # Contrarian threshold
+        self.contrarian_threshold = 0.70  # 70% consensus = contrarian bet
+
+        # Bot detection thresholds
+        self.bot_rapid_trade_seconds = 30  # Trades within 30 seconds = bot pattern
+
         # Track patterns across scans
         self._wallet_category_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
         self._alerted_trades: Set[str] = set()
+
+        # Track wallet trade timestamps for bot detection
+        self._wallet_trade_times: Dict[str, List[datetime]] = defaultdict(list)
 
     def scan_for_whales(self, limit: int = 100) -> List[WhaleAlert]:
         """Scan recent trades for whale activity.
@@ -62,14 +76,43 @@ class WhaleDetector:
 
         return alerts
 
+    def _detect_bot_pattern(self, wallet_address: str, trade_time: datetime) -> bool:
+        """Detect if wallet shows bot-like trading patterns.
+
+        Args:
+            wallet_address: Wallet address
+            trade_time: Current trade timestamp
+
+        Returns:
+            True if bot pattern detected
+        """
+        # Add current trade time
+        self._wallet_trade_times[wallet_address].append(trade_time)
+
+        # Keep only last 10 trades
+        times = self._wallet_trade_times[wallet_address][-10:]
+        self._wallet_trade_times[wallet_address] = times
+
+        # Check for rapid-fire trades (< 30 seconds apart)
+        if len(times) >= 2:
+            for i in range(1, len(times)):
+                time_diff = abs((times[i] - times[i - 1]).total_seconds())
+                if time_diff < self.bot_rapid_trade_seconds:
+                    return True
+
+        return False
+
     def analyze_trade(self, trade: WhaleTrade) -> Optional[WhaleAlert]:
         """Analyze a single trade for whale indicators.
 
-        Uses stricter criteria focused on wallet freshness over bet size:
+        Detection signals:
         - Ultra-fresh wallet (< 1 day) = highest signal
         - Low market count (< 3 markets) = suspicious
         - Quick to trade after wallet creation (wc/tx < 20%)
         - Trade recency (< 5 hours old)
+        - Imminent resolution (< 24 hours) = strong insider signal
+        - Contrarian bet (against 70%+ consensus) = insider signal
+        - Bot pattern detection = reduces confidence
 
         Args:
             trade: Trade to analyze
@@ -88,6 +131,9 @@ class WhaleDetector:
 
         # Get wallet profile
         wallet = self.activity_client.get_wallet_profile(trade.wallet_address)
+
+        # Check for bot pattern (reduces confidence)
+        is_bot = self._detect_bot_pattern(trade.wallet_address, trade.timestamp)
 
         # Check for alert conditions with stricter criteria
         alert_types: List[AlertType] = []
@@ -120,7 +166,32 @@ class WhaleDetector:
             reasons.append(f"Low market diversity: only {wallet.markets_traded} markets traded")
             confidence += 0.2
 
-        # 5. Large bet check (still relevant but less weight)
+        # 5. IMMINENT RESOLUTION CHECK - VERY STRONG INSIDER SIGNAL
+        hours_until = trade.hours_until_resolution
+        if hours_until is not None:
+            if hours_until < self.imminent_resolution_hours:
+                alert_types.append(AlertType.IMMINENT_RESOLUTION)
+                reasons.append(f"🚨 IMMINENT: Market resolves in {hours_until:.1f} hours!")
+                confidence += 0.25  # Huge boost for imminent resolution
+            elif hours_until < self.soon_resolution_hours:
+                alert_types.append(AlertType.IMMINENT_RESOLUTION)
+                reasons.append(f"⚠️ SOON: Market resolves in {hours_until:.0f} hours")
+                confidence += 0.15
+            elif hours_until < self.near_resolution_hours:
+                reasons.append(f"Near resolution: {hours_until:.0f} hours")
+                confidence += 0.05
+
+        # 6. CONTRARIAN BET CHECK - BETTING AGAINST CONSENSUS
+        if trade.is_contrarian_bet:
+            alert_types.append(AlertType.CONTRARIAN_BET)
+            yes_pct = (trade.market_yes_price or 0) * 100
+            if trade.outcome.upper() == "NO":
+                reasons.append(f"🔄 CONTRARIAN: Buying NO against {yes_pct:.0f}% YES consensus")
+            else:
+                reasons.append(f"🔄 CONTRARIAN: Buying YES at only {yes_pct:.0f}%")
+            confidence += 0.15
+
+        # 7. Large bet check (still relevant but less weight)
         if trade.value_usd >= 10000:  # Higher threshold for "large bet" label
             alert_types.append(AlertType.LARGE_BET)
             reasons.append(f"Large bet: ${trade.value_usd:,.0f}")
@@ -129,7 +200,7 @@ class WhaleDetector:
             reasons.append(f"Significant bet: ${trade.value_usd:,.0f}")
             confidence += 0.05
 
-        # 6. Repeat pattern check
+        # 8. Repeat pattern check
         if trade.market_category:
             self._wallet_category_counts[trade.wallet_address][trade.market_category] += 1
             category_count = self._wallet_category_counts[trade.wallet_address][trade.market_category]
@@ -139,13 +210,24 @@ class WhaleDetector:
                 reasons.append(f"Repeat pattern: {category_count} trades in {trade.market_category}")
                 confidence += 0.15
 
-        # 7. Liquidity grab check (if we have liquidity data)
+        # 9. Liquidity grab check (if we have liquidity data)
         if trade.market_liquidity and trade.market_liquidity > 0:
             liquidity_pct = trade.value_usd / trade.market_liquidity
             if liquidity_pct > 0.05:  # Taking >5% of liquidity
                 alert_types.append(AlertType.LIQUIDITY_GRAB)
                 reasons.append(f"Liquidity grab: {liquidity_pct:.1%} of market liquidity")
                 confidence += 0.15
+
+        # 10. BOT PATTERN CHECK - REDUCES CONFIDENCE
+        if is_bot:
+            confidence -= 0.30  # Significant penalty for bot-like behavior
+            reasons.append("⚠️ Bot pattern detected: rapid-fire trades")
+
+        # 11. NEW MARKET CHECK - REDUCES CONFIDENCE
+        market_age = trade.market_age_hours
+        if market_age is not None and market_age < 24:
+            confidence -= 0.10  # New market is less suspicious
+            reasons.append(f"New market: only {market_age:.0f} hours old")
 
         # REQUIRE fresh wallet signal for alert (stricter criteria)
         # We only care about fresh wallets - that's the insider signal
@@ -162,11 +244,21 @@ class WhaleDetector:
             confidence = min(confidence + 0.1, 1.0)
             reasons.insert(0, "🚨 VERY HIGH SIGNAL: Wallet created and trading immediately")
 
+        # MEGA BOOST for ultra-fresh + imminent resolution + contrarian
+        if (wallet.is_ultra_fresh and
+            AlertType.IMMINENT_RESOLUTION in alert_types and
+            AlertType.CONTRARIAN_BET in alert_types):
+            confidence = min(confidence + 0.2, 1.0)
+            reasons.insert(0, "💎 EXTREMELY HIGH SIGNAL: Fresh wallet + imminent resolution + contrarian bet")
+
+        # Ensure confidence stays in valid range
+        confidence = max(0.1, min(confidence, 1.0))
+
         return WhaleAlert(
             trade=trade,
             wallet=wallet,
             alert_types=alert_types,
-            confidence=min(confidence, 1.0),
+            confidence=confidence,
             reasons=reasons,
         )
 
@@ -187,6 +279,7 @@ class WhaleDetector:
     def reset_patterns(self) -> None:
         """Reset pattern tracking (e.g., at start of new day)."""
         self._wallet_category_counts.clear()
+        self._wallet_trade_times.clear()
 
     def reset_alerts(self) -> None:
         """Reset alerted trades (for new scan session)."""
@@ -217,14 +310,21 @@ def run_whale_scanner(
     activity_client = ActivityClient(settings)
     detector = WhaleDetector(settings, activity_client)
 
-    console.print(f"[bold green]🐋 Smart Money Scanner Started[/bold green]")
-    console.print(f"[bold]Stricter Insider Detection Criteria:[/bold]")
-    console.print(f"  • Min bet: ${min_bet_usd:,.0f}")
-    console.print(f"  • Ultra-fresh wallet: < 24 hours old")
-    console.print(f"  • Fresh wallet: < 7 days old")
-    console.print(f"  • Low market count: < 3 unique markets")
-    console.print(f"  • Trade freshness: < 5 hours old")
-    console.print(f"  • Scan interval: {interval_seconds}s")
+    console.print(f"[bold green]🐋 Smart Money Scanner v2.0 Started[/bold green]")
+    console.print(f"[bold]Detection Signals:[/bold]")
+    console.print(f"  [cyan]Wallet Analysis:[/cyan]")
+    console.print(f"    • Ultra-fresh: < 24 hours old (+35%)")
+    console.print(f"    • Fresh: < 7 days old (+20%)")
+    console.print(f"    • Low market count: < 3 markets (+20%)")
+    console.print(f"  [cyan]Market Context:[/cyan]")
+    console.print(f"    • Imminent resolution: < 6 hours (+25%)")
+    console.print(f"    • Soon resolution: < 24 hours (+15%)")
+    console.print(f"    • Contrarian bet: against 70%+ consensus (+15%)")
+    console.print(f"  [cyan]Filters:[/cyan]")
+    console.print(f"    • Min bet: ${min_bet_usd:,.0f}")
+    console.print(f"    • Trade freshness: < 5 hours old")
+    console.print(f"    • Bot pattern detection: -30% confidence")
+    console.print(f"  [cyan]Scan interval: {interval_seconds}s[/cyan]")
     console.print(f"[dim]Press Ctrl+C to stop[/dim]\n")
 
     iteration = 0

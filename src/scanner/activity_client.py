@@ -18,6 +18,7 @@ class ActivityClient:
     def __init__(self, settings: Settings):
         """Initialize the activity client."""
         self.base_url = "https://data-api.polymarket.com"
+        self.gamma_url = "https://gamma-api.polymarket.com"
         self._http_client = httpx.Client(timeout=30.0)
         self.settings = settings
 
@@ -25,9 +26,12 @@ class ActivityClient:
         self._wallet_cache: Dict[str, WalletProfile] = {}
         self._seen_trades: Set[str] = set()
 
-    def _get(self, endpoint: str, params: Optional[Dict] = None) -> Any:
-        """Make GET request to Data API."""
-        url = f"{self.base_url}{endpoint}"
+        # Cache for market data (slug -> market info)
+        self._market_cache: Dict[str, Dict[str, Any]] = {}
+
+    def _get(self, endpoint: str, params: Optional[Dict] = None, base_url: Optional[str] = None) -> Any:
+        """Make GET request to API."""
+        url = f"{base_url or self.base_url}{endpoint}"
         try:
             response = self._http_client.get(url, params=params)
             response.raise_for_status()
@@ -38,6 +42,32 @@ class ActivityClient:
         except Exception as e:
             logger.error(f"Error fetching {url}: {e}")
             return []
+
+    def get_market_data(self, slug: str) -> Optional[Dict[str, Any]]:
+        """Fetch market data from Gamma API.
+
+        Args:
+            slug: Market slug
+
+        Returns:
+            Market data dict with endDate, outcomePrices, createdAt, etc.
+        """
+        if not slug:
+            return None
+
+        # Check cache first
+        if slug in self._market_cache:
+            return self._market_cache[slug]
+
+        # Fetch from Gamma API
+        markets = self._get("/markets", {"slug": slug}, base_url=self.gamma_url)
+
+        if markets and len(markets) > 0:
+            market = markets[0]
+            self._market_cache[slug] = market
+            return market
+
+        return None
 
     def get_recent_trades(self, limit: int = 100) -> List[WhaleTrade]:
         """Fetch recent trades across all markets.
@@ -141,8 +171,13 @@ class ActivityClient:
         self._wallet_cache[address] = profile
         return profile
 
-    def _parse_trade(self, raw: Dict[str, Any]) -> WhaleTrade:
-        """Parse raw API response into WhaleTrade model."""
+    def _parse_trade(self, raw: Dict[str, Any], enrich_market: bool = True) -> WhaleTrade:
+        """Parse raw API response into WhaleTrade model.
+
+        Args:
+            raw: Raw trade data from API
+            enrich_market: Whether to fetch additional market data (end date, prices)
+        """
         # Calculate USD value
         size = float(raw.get("size", 0) or 0)
         price = float(raw.get("price", 0) or 0)
@@ -154,12 +189,50 @@ class ActivityClient:
         # Parse timestamp
         timestamp = datetime.fromtimestamp(raw.get("timestamp", 0))
 
+        # Get market slug for enrichment
+        slug = raw.get("slug", "")
+
+        # Market data defaults
+        market_end_date = None
+        market_created_at = None
+        market_yes_price = None
+
+        # Enrich with market data if available
+        if enrich_market and slug:
+            market_data = self.get_market_data(slug)
+            if market_data:
+                # Parse end date
+                end_date_str = market_data.get("endDate")
+                if end_date_str:
+                    try:
+                        market_end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                    except (ValueError, TypeError):
+                        pass
+
+                # Parse created at
+                created_str = market_data.get("createdAt")
+                if created_str:
+                    try:
+                        market_created_at = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+                    except (ValueError, TypeError):
+                        pass
+
+                # Parse YES price from outcomePrices
+                outcome_prices_str = market_data.get("outcomePrices", "[]")
+                try:
+                    import json
+                    prices = json.loads(outcome_prices_str) if isinstance(outcome_prices_str, str) else outcome_prices_str
+                    if prices and len(prices) > 0:
+                        market_yes_price = float(prices[0])
+                except (json.JSONDecodeError, ValueError, TypeError, IndexError):
+                    pass
+
         return WhaleTrade(
             id=raw.get("transactionHash", ""),
             wallet_address=raw.get("proxyWallet", ""),
             market_id=raw.get("conditionId", ""),
             market_question=raw.get("title", "Unknown Market"),
-            market_slug=raw.get("slug", ""),
+            market_slug=slug,
             side=raw.get("side", "BUY"),
             outcome=raw.get("outcome", "Unknown"),
             price=price,
@@ -167,6 +240,9 @@ class ActivityClient:
             value_usd=value_usd,
             timestamp=timestamp,
             market_category=raw.get("eventSlug", "").split("-")[0] if raw.get("eventSlug") else None,
+            market_end_date=market_end_date,
+            market_created_at=market_created_at,
+            market_yes_price=market_yes_price,
         )
 
     def clear_cache(self) -> None:

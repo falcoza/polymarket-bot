@@ -14,6 +14,8 @@ class AlertType(str, Enum):
     LARGE_BET = "large_bet"
     REPEAT_PATTERN = "repeat_pattern"
     LIQUIDITY_GRAB = "liquidity_grab"
+    IMMINENT_RESOLUTION = "imminent_resolution"
+    CONTRARIAN_BET = "contrarian_bet"
 
 
 class WhaleTrade(BaseModel):
@@ -36,6 +38,48 @@ class WhaleTrade(BaseModel):
     # Market context
     market_liquidity: Optional[float] = Field(default=None)
     market_category: Optional[str] = Field(default=None)
+
+    # Market timing (for resolution timing detection)
+    market_end_date: Optional[datetime] = Field(default=None, description="When market resolves")
+    market_created_at: Optional[datetime] = Field(default=None, description="When market was created")
+
+    # Market prices (for contrarian detection)
+    market_yes_price: Optional[float] = Field(default=None, description="Current YES price (0-1)")
+
+    @property
+    def hours_until_resolution(self) -> Optional[float]:
+        """Hours until market resolves. None if no end date."""
+        if not self.market_end_date:
+            return None
+        delta = self.market_end_date - datetime.utcnow()
+        return max(0, delta.total_seconds() / 3600)
+
+    @property
+    def is_imminent_resolution(self) -> bool:
+        """Is market resolving within 24 hours?"""
+        hours = self.hours_until_resolution
+        return hours is not None and hours < 24
+
+    @property
+    def market_age_hours(self) -> Optional[float]:
+        """Hours since market was created."""
+        if not self.market_created_at:
+            return None
+        delta = datetime.utcnow() - self.market_created_at
+        return delta.total_seconds() / 3600
+
+    @property
+    def is_contrarian_bet(self) -> bool:
+        """Is this bet against strong consensus (>70%)?"""
+        if self.market_yes_price is None:
+            return False
+        # Buying NO when YES > 70% = contrarian
+        if self.outcome.upper() == "NO" and self.market_yes_price > 0.70:
+            return True
+        # Buying YES when YES < 30% = contrarian
+        if self.outcome.upper() == "YES" and self.market_yes_price < 0.30:
+            return True
+        return False
 
 
 class WalletProfile(BaseModel):
@@ -151,24 +195,47 @@ class WhaleAlert(BaseModel):
         else:
             age_str = f"{self.wallet.wallet_age_days} days"
 
+        # Resolution timing display
+        resolution_str = "Unknown"
+        if self.trade.hours_until_resolution is not None:
+            hours = self.trade.hours_until_resolution
+            if hours < 6:
+                resolution_str = f"{hours:.1f} hours (🚨 IMMINENT)"
+            elif hours < 24:
+                resolution_str = f"{hours:.1f} hours (⚠️ SOON)"
+            elif hours < 72:
+                resolution_str = f"{hours:.0f} hours"
+            else:
+                resolution_str = f"{hours / 24:.0f} days"
+
+        # Market price display
+        price_str = ""
+        if self.trade.market_yes_price is not None:
+            yes_pct = self.trade.market_yes_price * 100
+            if self.trade.is_contrarian_bet:
+                price_str = f" (CONTRARIAN vs {yes_pct:.0f}% YES)"
+            else:
+                price_str = f" (Market: {yes_pct:.0f}% YES)"
+
         lines = [
             "",
-            "━" * 55,
+            "━" * 60,
             f"{conf_emoji} SMART MONEY ALERT (Confidence: {self.confidence:.0%})",
-            "━" * 55,
+            "━" * 60,
             f"Wallet:       {wallet_short}",
             f"Type:         {types_str}",
             f"Market:       \"{self.trade.market_question[:40]}...\"" if len(self.trade.market_question) > 40 else f"Market:       \"{self.trade.market_question}\"",
-            f"Action:       {self.trade.side} {self.trade.outcome} @ ${self.trade.price:.2f}",
+            f"Action:       {self.trade.side} {self.trade.outcome} @ ${self.trade.price:.2f}{price_str}",
             f"Size:         ${self.trade.value_usd:,.0f}",
-            "━" * 55,
+            f"Resolves In:  {resolution_str}",
+            "━" * 60,
             f"Wallet Age:   {age_str}",
             f"Markets:      {self.wallet.markets_traded} unique markets",
             f"Prior Trades: {self.wallet.total_trades}",
             f"wc/tx Ratio:  {self.wallet.wc_tx_ratio:.0%}" + (" (QUICK)" if self.wallet.is_quick_to_trade else ""),
-            "━" * 55,
+            "━" * 60,
             f"Polymarket:   https://polymarket.com/@{self.trade.wallet_address}",
-            "━" * 55,
+            "━" * 60,
         ]
 
         if self.reasons:
