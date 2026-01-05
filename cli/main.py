@@ -152,8 +152,21 @@ async def _run_bot(settings: Settings, strategy: str, interval: int) -> None:
             # Get current positions
             positions = storage.get_open_positions()
 
-            # Calculate portfolio snapshot
+            # UPDATE PRICES FIRST - before any checks
+            for pos in positions:
+                market = next((m for m in markets if m.id == pos.market_id), None)
+                if market:
+                    pos.update_price(market.yes_price)
+                    storage.update_position(pos)  # Persist to database
+
+            # Recalculate portfolio with updated prices
             positions_value = sum(p.current_value for p in positions)
+
+            # SAFEGUARD: Prevent negative cash display
+            if cash_balance < 0:
+                console.print(f"[red]WARNING: Cash went negative (${cash_balance:.2f}), resetting to 0[/red]")
+                cash_balance = 0
+
             portfolio = PortfolioSnapshot(
                 total_value=cash_balance + positions_value,
                 cash_balance=cash_balance,
@@ -162,7 +175,7 @@ async def _run_bot(settings: Settings, strategy: str, interval: int) -> None:
                 position_count=len(positions),
             )
 
-            # Check stop losses first
+            # Check stop losses AFTER price update
             stop_loss_positions = risk_manager.check_stop_losses(positions)
             for pos in stop_loss_positions:
                 order = await executor.close_position(pos, "stop_loss")
@@ -180,6 +193,10 @@ async def _run_bot(settings: Settings, strategy: str, interval: int) -> None:
                     signals = await strat.generate_signals(markets, positions)
 
                     for signal in signals:
+                        # SAFEGUARD: Skip if no cash left
+                        if cash_balance <= 0:
+                            break
+
                         order = await executor.execute_signal(signal, positions, portfolio)
                         if order and order.status.value == "filled":
                             # Find market for question
@@ -193,17 +210,31 @@ async def _run_bot(settings: Settings, strategy: str, interval: int) -> None:
                             storage.save_position(position)
                             storage.save_order(order)
 
+                            # Update cash and rebuild portfolio for next order
                             cash_balance -= order.value_usd
+                            if cash_balance < 0:
+                                cash_balance = 0  # Prevent negative
+                            positions.append(position)  # Add to current list
+                            positions_value = sum(p.current_value for p in positions)
+                            portfolio = PortfolioSnapshot(
+                                total_value=cash_balance + positions_value,
+                                cash_balance=cash_balance,
+                                positions_value=positions_value,
+                                total_unrealized_pnl=sum(p.unrealized_pnl for p in positions),
+                                position_count=len(positions),
+                            )
+
                             console.print(
                                 f"[cyan]Opened: {order.side} ${order.value_usd:.2f} "
                                 f"- {question[:40]}[/cyan]"
                             )
 
-                    # Check for exit signals
+                    # Check for exit signals (prices already updated at start of iteration)
                     for pos in positions:
+                        if not pos.id:  # Skip newly created positions this iteration
+                            continue
                         market = next((m for m in markets if m.id == pos.market_id), None)
                         if market:
-                            pos.update_price(market.yes_price)
                             exit_signal = strat.should_exit_position(pos, market)
                             if exit_signal:
                                 order = await executor.close_position(

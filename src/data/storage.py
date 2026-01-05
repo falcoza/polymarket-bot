@@ -277,6 +277,32 @@ class DatabaseStorage:
         conn.commit()
         conn.close()
 
+    def update_position(self, position: Position) -> None:
+        """Update position with current price and P&L."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """UPDATE positions SET
+               current_price = ?,
+               current_value = ?,
+               unrealized_pnl = ?,
+               unrealized_pnl_pct = ?,
+               last_updated = ?
+               WHERE id = ?""",
+            (
+                position.current_price,
+                position.current_value,
+                position.unrealized_pnl,
+                position.unrealized_pnl_pct,
+                datetime.utcnow().isoformat(),
+                position.id,
+            ),
+        )
+
+        conn.commit()
+        conn.close()
+
     def _row_to_position(self, row: tuple, description: Any) -> Position:
         """Convert database row to Position."""
         cols = [d[0] for d in description]
