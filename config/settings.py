@@ -221,6 +221,20 @@ class Settings(BaseSettings):
         default=60,
         description="Seconds between whale scans",
     )
+    whale_copy_max_usd: float = Field(
+        default=10.0,
+        description="Maximum USD per copy trade",
+    )
+
+    # Telegram Settings
+    telegram_bot_token: str = Field(
+        default="",
+        description="Telegram bot token from @BotFather",
+    )
+    telegram_chat_id: str = Field(
+        default="",
+        description="Telegram chat ID to send alerts to",
+    )
 
     def validate_for_trading(self) -> tuple[bool, str]:
         """Validate settings are sufficient for trading."""

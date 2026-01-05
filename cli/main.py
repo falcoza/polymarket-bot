@@ -817,6 +817,16 @@ def scan(
         "--limit", "-n",
         help="Number of trades to scan per iteration",
     ),
+    telegram: bool = typer.Option(
+        False,
+        "--telegram", "-t",
+        help="Send alerts to Telegram with copy buttons",
+    ),
+    copy_size: float = typer.Option(
+        10.0,
+        "--copy-size", "-c",
+        help="USD amount for copy trades",
+    ),
 ) -> None:
     """Scan for whale activity on Polymarket.
 
@@ -825,22 +835,60 @@ def scan(
     - Abnormally large trades (>$10k default)
     - Repeated entries into same market category
 
-    Alerts are printed to console for manual review.
+    Alerts are printed to console. Use --telegram to get alerts with copy buttons.
     """
+    asyncio.run(_scan_async(interval, min_bet, limit, telegram, copy_size))
+
+
+async def _scan_async(
+    interval: int,
+    min_bet: float,
+    limit: int,
+    use_telegram: bool,
+    copy_size: float,
+) -> None:
+    """Async whale scanner with optional Telegram integration."""
     from src.scanner.activity_client import ActivityClient
     from src.scanner.whale_detector import WhaleDetector
 
     settings = Settings()
 
-    console.print(f"[bold green]🐋 Whale Scanner Started[/bold green]")
-    console.print(f"  Min bet: ${min_bet:,.0f}")
-    console.print(f"  Interval: {interval}s")
-    console.print(f"  Press Ctrl+C to stop\n")
-
     # Initialize components
     activity_client = ActivityClient(settings)
     detector = WhaleDetector(settings, activity_client)
     detector.min_bet_usd = min_bet
+
+    # Telegram and copy trading setup
+    telegram_bot = None
+    copy_trader = None
+
+    if use_telegram:
+        from src.scanner.telegram_bot import TelegramAlertBot
+        from src.scanner.copy_trader import CopyTrader
+
+        telegram_bot = TelegramAlertBot(settings)
+        telegram_bot.max_copy_size = copy_size
+
+        if await telegram_bot.initialize():
+            copy_trader = CopyTrader(settings)
+            copy_trader.max_position_usd = copy_size
+
+            # Set copy callback
+            telegram_bot.set_copy_callback(copy_trader.execute_copy)
+
+            # Start polling for button clicks
+            await telegram_bot.start_polling()
+            console.print(f"[green]✓ Telegram bot connected[/green]")
+        else:
+            console.print(f"[yellow]⚠ Telegram not configured (set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)[/yellow]")
+            telegram_bot = None
+
+    console.print(f"[bold green]🐋 Whale Scanner Started[/bold green]")
+    console.print(f"  Min bet: ${min_bet:,.0f}")
+    console.print(f"  Interval: {interval}s")
+    console.print(f"  Telegram: {'✓' if telegram_bot else '✗'}")
+    console.print(f"  Copy size: ${copy_size:.0f}")
+    console.print(f"  Press Ctrl+C to stop\n")
 
     iteration = 0
     total_alerts = 0
@@ -857,7 +905,12 @@ def scan(
                 if alerts:
                     total_alerts += len(alerts)
                     for alert in alerts:
+                        # Always print to console
                         console.print(alert.format_console())
+
+                        # Send to Telegram if enabled
+                        if telegram_bot:
+                            await telegram_bot.send_alert(alert)
                 else:
                     console.print(f"[dim][{timestamp}] Scan #{iteration}: No whale activity detected[/dim]")
 
@@ -865,13 +918,19 @@ def scan(
                 console.print(f"[red]Scan error: {e}[/red]")
 
             # Wait for next scan
-            import time
-            time.sleep(interval)
+            await asyncio.sleep(interval)
 
     except KeyboardInterrupt:
         console.print(f"\n[yellow]Scanner stopped. Total alerts: {total_alerts}[/yellow]")
+        if copy_trader:
+            copies = copy_trader.get_copy_history()
+            if copies:
+                console.print(f"[cyan]Copy trades executed: {len(copies)}[/cyan]")
+                console.print(f"[cyan]Total copied: ${copy_trader.get_total_copied_usd():.2f}[/cyan]")
     finally:
         activity_client.close()
+        if telegram_bot:
+            await telegram_bot.stop()
 
 
 def main() -> None:
