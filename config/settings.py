@@ -204,6 +204,24 @@ class Settings(BaseSettings):
         description="Log file path",
     )
 
+    # Whale Scanner Settings
+    whale_min_bet_usd: float = Field(
+        default=10000.0,
+        description="Minimum bet size to trigger whale alert",
+    )
+    whale_fresh_wallet_days: int = Field(
+        default=30,
+        description="Days to consider a wallet 'fresh'",
+    )
+    whale_max_prior_trades: int = Field(
+        default=10,
+        description="Max prior trades to consider wallet 'new'",
+    )
+    whale_scan_interval: int = Field(
+        default=60,
+        description="Seconds between whale scans",
+    )
+
     def validate_for_trading(self) -> tuple[bool, str]:
         """Validate settings are sufficient for trading."""
         if not self.polygon_wallet_private_key:

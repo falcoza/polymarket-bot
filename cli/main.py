@@ -800,6 +800,80 @@ def audit() -> None:
             )
 
 
+@app.command()
+def scan(
+    interval: int = typer.Option(
+        60,
+        "--interval", "-i",
+        help="Seconds between scans",
+    ),
+    min_bet: float = typer.Option(
+        10000,
+        "--min-bet", "-m",
+        help="Minimum bet size to trigger alert (USD)",
+    ),
+    limit: int = typer.Option(
+        100,
+        "--limit", "-n",
+        help="Number of trades to scan per iteration",
+    ),
+) -> None:
+    """Scan for whale activity on Polymarket.
+
+    Detects:
+    - Fresh wallets making large bets
+    - Abnormally large trades (>$10k default)
+    - Repeated entries into same market category
+
+    Alerts are printed to console for manual review.
+    """
+    from src.scanner.activity_client import ActivityClient
+    from src.scanner.whale_detector import WhaleDetector
+
+    settings = Settings()
+
+    console.print(f"[bold green]🐋 Whale Scanner Started[/bold green]")
+    console.print(f"  Min bet: ${min_bet:,.0f}")
+    console.print(f"  Interval: {interval}s")
+    console.print(f"  Press Ctrl+C to stop\n")
+
+    # Initialize components
+    activity_client = ActivityClient(settings)
+    detector = WhaleDetector(settings, activity_client)
+    detector.min_bet_usd = min_bet
+
+    iteration = 0
+    total_alerts = 0
+
+    try:
+        while True:
+            iteration += 1
+            timestamp = datetime.now().strftime("%H:%M:%S")
+
+            try:
+                # Scan for whales
+                alerts = detector.scan_for_whales(limit=limit)
+
+                if alerts:
+                    total_alerts += len(alerts)
+                    for alert in alerts:
+                        console.print(alert.format_console())
+                else:
+                    console.print(f"[dim][{timestamp}] Scan #{iteration}: No whale activity detected[/dim]")
+
+            except Exception as e:
+                console.print(f"[red]Scan error: {e}[/red]")
+
+            # Wait for next scan
+            import time
+            time.sleep(interval)
+
+    except KeyboardInterrupt:
+        console.print(f"\n[yellow]Scanner stopped. Total alerts: {total_alerts}[/yellow]")
+    finally:
+        activity_client.close()
+
+
 def main() -> None:
     """Entry point."""
     app()
