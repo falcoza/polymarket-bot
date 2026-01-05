@@ -201,19 +201,23 @@ class ActivityClient:
         if enrich_market and slug:
             market_data = self.get_market_data(slug)
             if market_data:
-                # Parse end date
+                # Parse end date (strip timezone for naive comparison)
                 end_date_str = market_data.get("endDate")
                 if end_date_str:
                     try:
-                        market_end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                        # Parse and convert to naive UTC datetime
+                        dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                        market_end_date = dt.replace(tzinfo=None)
                     except (ValueError, TypeError):
                         pass
 
-                # Parse created at
+                # Parse created at (strip timezone for naive comparison)
                 created_str = market_data.get("createdAt")
                 if created_str:
                     try:
-                        market_created_at = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+                        # Parse and convert to naive UTC datetime
+                        dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+                        market_created_at = dt.replace(tzinfo=None)
                     except (ValueError, TypeError):
                         pass
 
