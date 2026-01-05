@@ -25,10 +25,12 @@ class WhaleDetector:
         self.settings = settings
         self.activity_client = activity_client
 
-        # Detection thresholds
-        self.min_bet_usd = getattr(settings, "whale_min_bet_usd", 10000)
-        self.fresh_wallet_days = getattr(settings, "whale_fresh_wallet_days", 30)
-        self.max_prior_trades = getattr(settings, "whale_max_prior_trades", 10)
+        # Detection thresholds - stricter criteria for insider detection
+        self.min_bet_usd = getattr(settings, "whale_min_bet_usd", 2000)  # Lower threshold, wallet freshness matters more
+        self.fresh_wallet_days = getattr(settings, "whale_fresh_wallet_days", 7)  # 7 days = fresh
+        self.ultra_fresh_hours = 24  # < 1 day = ultra fresh (highest signal)
+        self.max_markets_traded = 3  # < 3 unique markets = suspicious
+        self.max_trade_age_hours = 5  # Only alert on trades < 5 hours old
         self.repeat_pattern_threshold = 3  # Trades in same category
 
         # Track patterns across scans
@@ -63,44 +65,71 @@ class WhaleDetector:
     def analyze_trade(self, trade: WhaleTrade) -> Optional[WhaleAlert]:
         """Analyze a single trade for whale indicators.
 
+        Uses stricter criteria focused on wallet freshness over bet size:
+        - Ultra-fresh wallet (< 1 day) = highest signal
+        - Low market count (< 3 markets) = suspicious
+        - Quick to trade after wallet creation (wc/tx < 20%)
+        - Trade recency (< 5 hours old)
+
         Args:
             trade: Trade to analyze
 
         Returns:
             WhaleAlert if suspicious, None otherwise
         """
-        # Skip small trades
+        # Skip very small trades (but lower threshold than before)
         if trade.value_usd < self.min_bet_usd:
+            return None
+
+        # Check trade freshness - only alert on recent trades
+        trade_age_hours = (datetime.utcnow() - trade.timestamp).total_seconds() / 3600
+        if trade_age_hours > self.max_trade_age_hours:
             return None
 
         # Get wallet profile
         wallet = self.activity_client.get_wallet_profile(trade.wallet_address)
 
-        # Check for alert conditions
+        # Check for alert conditions with stricter criteria
         alert_types: List[AlertType] = []
         reasons: List[str] = []
-        confidence = 0.5
+        confidence = 0.3  # Start lower, build up with signals
 
-        # 1. Large bet check
-        if trade.value_usd >= self.min_bet_usd:
-            alert_types.append(AlertType.LARGE_BET)
-            reasons.append(f"Large bet: ${trade.value_usd:,.0f}")
-            confidence += 0.1
+        # 1. ULTRA FRESH WALLET CHECK (< 1 day) - HIGHEST SIGNAL
+        if wallet.is_ultra_fresh:
+            alert_types.append(AlertType.FRESH_WALLET)
+            reasons.append(f"🔥 Ultra-fresh wallet: {wallet.wallet_age_hours:.1f} hours old")
+            confidence += 0.35  # Huge boost
 
-        # 2. Fresh wallet check
-        if wallet.is_fresh:
+        # 2. Fresh wallet check (< 7 days)
+        elif wallet.is_fresh:
             alert_types.append(AlertType.FRESH_WALLET)
             reasons.append(f"Fresh wallet: {wallet.wallet_age_days} days old")
             confidence += 0.2
 
-        # 3. New trader check (few prior trades)
-        if wallet.is_new_trader:
+        # 3. Quick to trade after wallet creation (wc/tx ratio < 20%)
+        if wallet.is_quick_to_trade:
             if AlertType.FRESH_WALLET not in alert_types:
                 alert_types.append(AlertType.FRESH_WALLET)
-            reasons.append(f"New trader: only {wallet.total_trades} prior trades")
-            confidence += 0.15
+            reasons.append(f"Quick to trade: wc/tx ratio {wallet.wc_tx_ratio:.0%}")
+            confidence += 0.25
 
-        # 4. Repeat pattern check
+        # 4. Low market count (< 3 unique markets) - suspicious focus
+        if wallet.is_low_market_count:
+            if AlertType.FRESH_WALLET not in alert_types:
+                alert_types.append(AlertType.FRESH_WALLET)
+            reasons.append(f"Low market diversity: only {wallet.markets_traded} markets traded")
+            confidence += 0.2
+
+        # 5. Large bet check (still relevant but less weight)
+        if trade.value_usd >= 10000:  # Higher threshold for "large bet" label
+            alert_types.append(AlertType.LARGE_BET)
+            reasons.append(f"Large bet: ${trade.value_usd:,.0f}")
+            confidence += 0.1
+        elif trade.value_usd >= 5000:
+            reasons.append(f"Significant bet: ${trade.value_usd:,.0f}")
+            confidence += 0.05
+
+        # 6. Repeat pattern check
         if trade.market_category:
             self._wallet_category_counts[trade.wallet_address][trade.market_category] += 1
             category_count = self._wallet_category_counts[trade.wallet_address][trade.market_category]
@@ -110,30 +139,36 @@ class WhaleDetector:
                 reasons.append(f"Repeat pattern: {category_count} trades in {trade.market_category}")
                 confidence += 0.15
 
-        # 5. Liquidity grab check (if we have liquidity data)
+        # 7. Liquidity grab check (if we have liquidity data)
         if trade.market_liquidity and trade.market_liquidity > 0:
             liquidity_pct = trade.value_usd / trade.market_liquidity
             if liquidity_pct > 0.05:  # Taking >5% of liquidity
                 alert_types.append(AlertType.LIQUIDITY_GRAB)
                 reasons.append(f"Liquidity grab: {liquidity_pct:.1%} of market liquidity")
-                confidence += 0.2
+                confidence += 0.15
 
-        # Generate alert if we have at least one alert type
-        if alert_types:
-            # Higher confidence for fresh wallet + large bet combo
-            if AlertType.FRESH_WALLET in alert_types and AlertType.LARGE_BET in alert_types:
-                confidence = min(confidence + 0.2, 1.0)
-                reasons.insert(0, "🔥 High signal: Fresh wallet making large bet")
+        # REQUIRE fresh wallet signal for alert (stricter criteria)
+        # We only care about fresh wallets - that's the insider signal
+        if AlertType.FRESH_WALLET not in alert_types:
+            return None
 
-            return WhaleAlert(
-                trade=trade,
-                wallet=wallet,
-                alert_types=alert_types,
-                confidence=min(confidence, 1.0),
-                reasons=reasons,
-            )
+        # Boost confidence for ultra-fresh + low market count combo
+        if wallet.is_ultra_fresh and wallet.is_low_market_count:
+            confidence = min(confidence + 0.15, 1.0)
+            reasons.insert(0, "⚠️ HIGH SIGNAL: Ultra-fresh wallet with narrow focus")
 
-        return None
+        # Boost for quick-to-trade + ultra-fresh combo
+        if wallet.is_quick_to_trade and wallet.is_ultra_fresh:
+            confidence = min(confidence + 0.1, 1.0)
+            reasons.insert(0, "🚨 VERY HIGH SIGNAL: Wallet created and trading immediately")
+
+        return WhaleAlert(
+            trade=trade,
+            wallet=wallet,
+            alert_types=alert_types,
+            confidence=min(confidence, 1.0),
+            reasons=reasons,
+        )
 
     def get_top_whales(self, hours: int = 24, min_volume: float = 50000) -> List[Dict]:
         """Get top whale wallets by volume in recent period.
@@ -182,10 +217,15 @@ def run_whale_scanner(
     activity_client = ActivityClient(settings)
     detector = WhaleDetector(settings, activity_client)
 
-    console.print(f"[bold green]🐋 Whale Scanner Started[/bold green]")
-    console.print(f"  Min bet: ${min_bet_usd:,.0f}")
-    console.print(f"  Interval: {interval_seconds}s")
-    console.print(f"  Press Ctrl+C to stop\n")
+    console.print(f"[bold green]🐋 Smart Money Scanner Started[/bold green]")
+    console.print(f"[bold]Stricter Insider Detection Criteria:[/bold]")
+    console.print(f"  • Min bet: ${min_bet_usd:,.0f}")
+    console.print(f"  • Ultra-fresh wallet: < 24 hours old")
+    console.print(f"  • Fresh wallet: < 7 days old")
+    console.print(f"  • Low market count: < 3 unique markets")
+    console.print(f"  • Trade freshness: < 5 hours old")
+    console.print(f"  • Scan interval: {interval_seconds}s")
+    console.print(f"[dim]Press Ctrl+C to stop[/dim]\n")
 
     iteration = 0
     total_alerts = 0

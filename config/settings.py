@@ -204,18 +204,26 @@ class Settings(BaseSettings):
         description="Log file path",
     )
 
-    # Whale Scanner Settings
+    # Whale Scanner Settings (stricter insider detection)
     whale_min_bet_usd: float = Field(
-        default=10000.0,
-        description="Minimum bet size to trigger whale alert",
+        default=2000.0,
+        description="Minimum bet size to trigger whale alert (lower now, freshness matters more)",
     )
     whale_fresh_wallet_days: int = Field(
-        default=30,
+        default=7,
         description="Days to consider a wallet 'fresh'",
     )
-    whale_max_prior_trades: int = Field(
-        default=10,
-        description="Max prior trades to consider wallet 'new'",
+    whale_ultra_fresh_hours: int = Field(
+        default=24,
+        description="Hours to consider a wallet 'ultra-fresh' (highest signal)",
+    )
+    whale_max_markets_traded: int = Field(
+        default=3,
+        description="Max unique markets for suspicious wallet (< this = alert)",
+    )
+    whale_max_trade_age_hours: int = Field(
+        default=5,
+        description="Only alert on trades younger than this (hours)",
     )
     whale_scan_interval: int = Field(
         default=60,

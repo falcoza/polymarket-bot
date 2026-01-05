@@ -808,9 +808,9 @@ def scan(
         help="Seconds between scans",
     ),
     min_bet: float = typer.Option(
-        10000,
+        2000,
         "--min-bet", "-m",
-        help="Minimum bet size to trigger alert (USD)",
+        help="Minimum bet size to trigger alert (USD) - lower since wallet freshness matters more",
     ),
     limit: int = typer.Option(
         100,

@@ -51,10 +51,11 @@ class WalletProfile(BaseModel):
     # Timing
     first_trade_date: Optional[datetime] = Field(default=None)
     last_trade_date: Optional[datetime] = Field(default=None)
+    wallet_created_date: Optional[datetime] = Field(default=None)
 
     # Positions
     open_positions: int = Field(default=0)
-    markets_traded: int = Field(default=0)
+    markets_traded: int = Field(default=0)  # Unique markets, not total trades
 
     @property
     def wallet_age_days(self) -> int:
@@ -65,14 +66,53 @@ class WalletProfile(BaseModel):
         return delta.days
 
     @property
+    def wallet_age_hours(self) -> float:
+        """Hours since first trade (more granular)."""
+        if not self.first_trade_date:
+            return 0
+        delta = datetime.utcnow() - self.first_trade_date
+        return delta.total_seconds() / 3600
+
+    @property
+    def is_ultra_fresh(self) -> bool:
+        """Is this wallet < 1 day old (highest signal)."""
+        return self.wallet_age_hours < 24
+
+    @property
     def is_fresh(self) -> bool:
-        """Is this a fresh wallet (< 30 days old)."""
-        return self.wallet_age_days < 30
+        """Is this a fresh wallet (< 7 days old)."""
+        return self.wallet_age_days < 7
 
     @property
     def is_new_trader(self) -> bool:
-        """Is this a new trader (< 10 trades)."""
-        return self.total_trades < 10
+        """Is this a new trader (< 3 unique markets)."""
+        return self.markets_traded < 3
+
+    @property
+    def is_low_market_count(self) -> bool:
+        """Has traded in very few markets (< 3)."""
+        return self.markets_traded < 3
+
+    @property
+    def wc_tx_ratio(self) -> float:
+        """Wallet creation to first transaction ratio (0-1).
+
+        Lower ratio = faster to trade after creation = more suspicious.
+        """
+        if not self.wallet_created_date or not self.first_trade_date:
+            return 1.0  # Unknown, assume not suspicious
+
+        # Time from creation to first trade
+        time_to_trade = (self.first_trade_date - self.wallet_created_date).total_seconds()
+        # Normalize: 0% = immediate trade, 100% = traded after 24+ hours
+        # wc/tx under 20% means they traded within ~5 hours of creation
+        ratio = min(time_to_trade / (24 * 3600), 1.0)
+        return ratio
+
+    @property
+    def is_quick_to_trade(self) -> bool:
+        """Did they trade very quickly after wallet creation (wc/tx < 20%)."""
+        return self.wc_tx_ratio < 0.20
 
 
 class WhaleAlert(BaseModel):
@@ -97,27 +137,44 @@ class WhaleAlert(BaseModel):
         types_str = " + ".join([t.value.replace("_", " ").title() for t in self.alert_types])
         wallet_short = f"{self.trade.wallet_address[:6]}...{self.trade.wallet_address[-4:]}"
 
+        # Determine confidence emoji
+        if self.confidence >= 0.8:
+            conf_emoji = "🚨"
+        elif self.confidence >= 0.6:
+            conf_emoji = "⚠️"
+        else:
+            conf_emoji = "📊"
+
+        # Wallet age display
+        if self.wallet.wallet_age_hours < 24:
+            age_str = f"{self.wallet.wallet_age_hours:.1f} hours (ULTRA FRESH)"
+        else:
+            age_str = f"{self.wallet.wallet_age_days} days"
+
         lines = [
             "",
-            "━" * 50,
-            "🐋 WHALE ALERT",
-            "━" * 50,
-            f"Wallet:  {wallet_short}",
-            f"Type:    {types_str}",
-            f"Market:  \"{self.trade.market_question[:45]}...\"" if len(self.trade.market_question) > 45 else f"Market:  \"{self.trade.market_question}\"",
-            f"Action:  {self.trade.side} {self.trade.outcome} @ ${self.trade.price:.2f}",
-            f"Size:    ${self.trade.value_usd:,.0f}",
-            "━" * 50,
-            f"Wallet Age:    {self.wallet.wallet_age_days} days",
-            f"Prior Trades:  {self.wallet.total_trades}",
-            f"Polymarket:    https://polymarket.com/@{self.trade.wallet_address}",
-            "━" * 50,
+            "━" * 55,
+            f"{conf_emoji} SMART MONEY ALERT (Confidence: {self.confidence:.0%})",
+            "━" * 55,
+            f"Wallet:       {wallet_short}",
+            f"Type:         {types_str}",
+            f"Market:       \"{self.trade.market_question[:40]}...\"" if len(self.trade.market_question) > 40 else f"Market:       \"{self.trade.market_question}\"",
+            f"Action:       {self.trade.side} {self.trade.outcome} @ ${self.trade.price:.2f}",
+            f"Size:         ${self.trade.value_usd:,.0f}",
+            "━" * 55,
+            f"Wallet Age:   {age_str}",
+            f"Markets:      {self.wallet.markets_traded} unique markets",
+            f"Prior Trades: {self.wallet.total_trades}",
+            f"wc/tx Ratio:  {self.wallet.wc_tx_ratio:.0%}" + (" (QUICK)" if self.wallet.is_quick_to_trade else ""),
+            "━" * 55,
+            f"Polymarket:   https://polymarket.com/@{self.trade.wallet_address}",
+            "━" * 55,
         ]
 
         if self.reasons:
-            lines.append("Reasons:")
+            lines.append("Signals Detected:")
             for reason in self.reasons:
                 lines.append(f"  • {reason}")
-            lines.append("━" * 50)
+            lines.append("━" * 55)
 
         return "\n".join(lines)
