@@ -81,6 +81,21 @@ class WhaleTrade(BaseModel):
             return True
         return False
 
+    @property
+    def risk_reward_ratio(self) -> float:
+        """Calculate risk/reward ratio for this trade.
+
+        For a YES position: risk is losing entry_price, reward is (1 - entry_price)
+
+        Returns:
+            Risk/reward ratio (higher is better, 1.0 = even, >1 = favorable)
+        """
+        if self.price <= 0 or self.price >= 1:
+            return 0
+        risk = self.price
+        reward = 1.0 - self.price
+        return reward / risk
+
 
 class WalletProfile(BaseModel):
     """Profile information about a wallet."""
@@ -175,6 +190,7 @@ class WhaleAlert(BaseModel):
 
     # Context
     reasons: List[str] = Field(default_factory=list)
+    signals: List[str] = Field(default_factory=list, description="Clean signal list for storage")
 
     def format_console(self) -> str:
         """Format alert for console output."""

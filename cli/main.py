@@ -803,9 +803,9 @@ def audit() -> None:
 @app.command()
 def scan(
     interval: int = typer.Option(
-        60,
+        300,  # 5 minutes - prevents API blocking
         "--interval", "-i",
-        help="Seconds between scans",
+        help="Seconds between scans (default 300s to prevent API blocking)",
     ),
     min_bet: float = typer.Option(
         2000,
@@ -836,6 +836,8 @@ def scan(
     - Repeated entries into same market category
 
     Alerts are printed to console. Use --telegram to get alerts with copy buttons.
+
+    Memory-safe and rate-limited to prevent Railway OOM and API blocking.
     """
     asyncio.run(_scan_async(interval, min_bet, limit, telegram, copy_size))
 
@@ -883,11 +885,13 @@ async def _scan_async(
             console.print(f"[yellow]⚠ Telegram not configured (set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)[/yellow]")
             telegram_bot = None
 
-    console.print(f"[bold green]🐋 Whale Scanner Started[/bold green]")
+    console.print(f"[bold green]🐋 Whale Scanner v3.1 (Memory Safe)[/bold green]")
     console.print(f"  Min bet: ${min_bet:,.0f}")
     console.print(f"  Interval: {interval}s")
     console.print(f"  Telegram: {'✓' if telegram_bot else '✗'}")
     console.print(f"  Auto paper trade: ✓ (${copy_size:.0f} per whale)")
+    console.print(f"  Memory protection: ✓ (LRU caches + daily reset)")
+    console.print(f"  Rate limiting: ✓ (30 req/min)")
     console.print(f"  Press Ctrl+C to stop\n")
 
     iteration = 0
@@ -921,6 +925,16 @@ async def _scan_async(
                 else:
                     console.print(f"[dim][{timestamp}] Scan #{iteration}: No whale activity detected[/dim]")
 
+                # Log memory stats every 10 iterations (for monitoring OOM risk)
+                if iteration % 10 == 0:
+                    client_stats = activity_client.get_memory_stats()
+                    detector_stats = detector.get_memory_stats()
+                    console.print(
+                        f"[dim]  Memory: seen_trades={client_stats['seen_trades_size']}, "
+                        f"wallets={detector_stats['alerted_trades']}, "
+                        f"errors={client_stats['consecutive_errors']}[/dim]"
+                    )
+
             except Exception as e:
                 console.print(f"[red]Scan error: {e}[/red]")
 
@@ -930,14 +944,225 @@ async def _scan_async(
     except KeyboardInterrupt:
         console.print(f"\n[yellow]Scanner stopped. Total alerts: {total_alerts}[/yellow]")
         if copy_trader:
-            copies = copy_trader.get_copy_history()
-            if copies:
-                console.print(f"[cyan]Copy trades executed: {len(copies)}[/cyan]")
-                console.print(f"[cyan]Total copied: ${copy_trader.get_total_copied_usd():.2f}[/cyan]")
+            # Show P&L summary
+            summary = copy_trader.get_pnl_summary()
+            console.print(f"\n[bold]📊 Session P&L Summary[/bold]")
+            console.print(f"  Trades executed: {summary.get('total_trades', 0)}")
+            console.print(f"  Total deployed: ${summary.get('total_deployed_usd', 0):.2f}")
+            console.print(f"  Open trades: {summary.get('open_trades', 0)}")
+            console.print(f"  Resolved: {summary.get('resolved_trades', 0)}")
+            if summary.get('resolved_trades', 0) > 0:
+                pnl = summary.get('total_realized_pnl', 0)
+                pnl_color = "green" if pnl >= 0 else "red"
+                console.print(f"  Realized P&L: [{pnl_color}]${pnl:+.2f}[/{pnl_color}]")
+                console.print(f"  Win rate: {summary.get('win_rate', 0):.1%}")
     finally:
         activity_client.close()
         if telegram_bot:
             await telegram_bot.stop()
+
+
+@app.command()
+def pnl(
+    action: str = typer.Argument(
+        "summary",
+        help="Action: summary, open, resolved, check",
+    ),
+    limit: int = typer.Option(
+        20,
+        "--limit", "-n",
+        help="Number of trades to show",
+    ),
+) -> None:
+    """Show copy trade P&L and manage resolutions.
+
+    Actions:
+      summary  - Show overall P&L summary
+      open     - List open (unresolved) trades
+      resolved - List resolved trades with P&L
+      check    - Check and resolve any completed markets
+    """
+    if action == "summary":
+        _pnl_summary()
+    elif action == "open":
+        _pnl_open_trades(limit)
+    elif action == "resolved":
+        _pnl_resolved_trades(limit)
+    elif action == "check":
+        asyncio.run(_pnl_check_resolutions())
+    else:
+        console.print(f"[red]Unknown action: {action}[/red]")
+        console.print("Available actions: summary, open, resolved, check")
+        raise typer.Exit(1)
+
+
+def _pnl_summary() -> None:
+    """Show P&L summary for copy trades."""
+    storage = DatabaseStorage()
+
+    try:
+        summary = storage.get_copy_trade_summary()
+    except Exception as e:
+        console.print(f"[red]Error getting summary: {e}[/red]")
+        return
+
+    console.print("\n[bold]📊 Copy Trade P&L Summary[/bold]\n")
+
+    # Overall stats
+    table = Table(show_header=False, box=None)
+    table.add_column("Metric", style="dim")
+    table.add_column("Value", justify="right")
+
+    total_trades = summary.get("total_trades", 0)
+    open_trades = summary.get("open_trades", 0)
+    resolved = summary.get("resolved_trades", 0)
+    winning = summary.get("winning_trades", 0)
+    losing = summary.get("losing_trades", 0)
+    total_pnl = summary.get("total_realized_pnl", 0)
+    total_deployed = summary.get("total_deployed_usd", 0)
+
+    pnl_color = "green" if total_pnl >= 0 else "red"
+    win_rate = summary.get("win_rate", 0)
+
+    table.add_row("Total Trades", f"{total_trades}")
+    table.add_row("Open Positions", f"{open_trades}")
+    table.add_row("Resolved", f"{resolved}")
+    table.add_row("Winning", f"[green]{winning}[/green]")
+    table.add_row("Losing", f"[red]{losing}[/red]")
+    table.add_row("Win Rate", f"{win_rate:.1%}" if resolved > 0 else "N/A")
+    table.add_row("", "")
+    table.add_row("Total Deployed", f"${total_deployed:.2f}")
+    table.add_row("Realized P&L", f"[{pnl_color}]${total_pnl:+.2f}[/{pnl_color}]")
+
+    if resolved > 0 and total_deployed > 0:
+        # Calculate ROI only on resolved trades
+        resolved_deployed = resolved * 10  # Assuming $10 per trade
+        roi = (total_pnl / resolved_deployed) * 100 if resolved_deployed > 0 else 0
+        table.add_row("ROI (Resolved)", f"[{pnl_color}]{roi:+.1f}%[/{pnl_color}]")
+
+    console.print(table)
+
+    # Best and worst trades
+    max_profit = summary.get("max_profit", 0)
+    max_loss = summary.get("max_loss", 0)
+
+    if max_profit or max_loss:
+        console.print("\n[bold]Best/Worst Trades[/bold]")
+        if max_profit:
+            console.print(f"  Best:  [green]${max_profit:+.2f}[/green]")
+        if max_loss:
+            console.print(f"  Worst: [red]${max_loss:+.2f}[/red]")
+
+
+def _pnl_open_trades(limit: int) -> None:
+    """Show open (unresolved) copy trades."""
+    storage = DatabaseStorage()
+
+    try:
+        open_trades = storage.get_open_copy_trades()
+    except Exception as e:
+        console.print(f"[red]Error getting open trades: {e}[/red]")
+        return
+
+    if not open_trades:
+        console.print("[yellow]No open copy trades[/yellow]")
+        return
+
+    table = Table(title=f"Open Copy Trades ({len(open_trades)} total)")
+    table.add_column("Time", width=12)
+    table.add_column("Market", width=40)
+    table.add_column("Side")
+    table.add_column("Entry", justify="right")
+    table.add_column("Size", justify="right")
+    table.add_column("Conf")
+
+    for trade in open_trades[:limit]:
+        timestamp = trade.get("timestamp", "")
+        if timestamp:
+            timestamp = timestamp[5:16].replace("T", " ")  # MM-DD HH:MM
+
+        table.add_row(
+            timestamp,
+            trade.get("market_question", "")[:40],
+            f"{trade.get('side', '')} {trade.get('outcome', '')}"[:12],
+            f"${trade.get('entry_price', 0):.2f}",
+            f"${trade.get('size_usd', 0):.2f}",
+            f"{trade.get('confidence', 0)}%",
+        )
+
+    console.print(table)
+
+    # Summary
+    total_open_value = sum(t.get("size_usd", 0) for t in open_trades)
+    console.print(f"\n[dim]Total open value: ${total_open_value:.2f}[/dim]")
+
+
+def _pnl_resolved_trades(limit: int) -> None:
+    """Show resolved copy trades with P&L."""
+    storage = DatabaseStorage()
+
+    try:
+        resolved_trades = storage.get_copy_trades(status="resolved", limit=limit)
+    except Exception as e:
+        console.print(f"[red]Error getting resolved trades: {e}[/red]")
+        return
+
+    if not resolved_trades:
+        console.print("[yellow]No resolved copy trades yet[/yellow]")
+        return
+
+    table = Table(title=f"Resolved Copy Trades (showing {min(limit, len(resolved_trades))})")
+    table.add_column("Resolved", width=12)
+    table.add_column("Market", width=35)
+    table.add_column("Our Bet")
+    table.add_column("Result")
+    table.add_column("P&L", justify="right")
+
+    for trade in resolved_trades:
+        resolved_at = trade.get("resolved_at", "")
+        if resolved_at:
+            resolved_at = resolved_at[5:16].replace("T", " ")
+
+        pnl = trade.get("realized_pnl", 0)
+        pnl_color = "green" if pnl > 0 else "red" if pnl < 0 else "dim"
+
+        result = trade.get("resolved_outcome", "")
+        result_icon = "✅" if pnl > 0 else "❌" if pnl < 0 else "➖"
+
+        table.add_row(
+            resolved_at,
+            trade.get("market_question", "")[:35],
+            f"{trade.get('side', '')} {trade.get('outcome', '')}"[:12],
+            f"{result_icon} {result}"[:12],
+            f"[{pnl_color}]${pnl:+.2f}[/{pnl_color}]",
+        )
+
+    console.print(table)
+
+
+async def _pnl_check_resolutions() -> None:
+    """Check and resolve any completed markets."""
+    from src.scanner.resolution_tracker import ResolutionTracker
+
+    console.print("[bold]Checking for resolved markets...[/bold]\n")
+
+    tracker = ResolutionTracker()
+
+    try:
+        result = await tracker.check_and_resolve_trades()
+
+        console.print(f"Checked: {result['checked']} open trades")
+        console.print(f"Resolved: {result['resolved']} trades")
+
+        if result['resolved'] > 0:
+            pnl = result['total_pnl']
+            pnl_color = "green" if pnl >= 0 else "red"
+            console.print(f"P&L from resolutions: [{pnl_color}]${pnl:+.2f}[/{pnl_color}]")
+        else:
+            console.print("[dim]No new resolutions[/dim]")
+
+    except Exception as e:
+        console.print(f"[red]Error checking resolutions: {e}[/red]")
 
 
 def main() -> None:

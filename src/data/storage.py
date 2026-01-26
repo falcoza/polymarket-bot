@@ -135,6 +135,35 @@ class DatabaseStorage:
             )
         """)
 
+        # Copy trades table for whale copy trading P&L tracking
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS copy_trades (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                whale_wallet TEXT NOT NULL,
+                market_id TEXT NOT NULL,
+                market_slug TEXT,
+                market_question TEXT,
+                condition_id TEXT,
+                token_id TEXT,
+                side TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                entry_price REAL NOT NULL,
+                size_usd REAL NOT NULL,
+                shares REAL NOT NULL,
+                whale_size_usd REAL,
+                confidence INTEGER,
+                signals TEXT,
+                status TEXT DEFAULT 'open',
+                resolved_outcome TEXT,
+                exit_price REAL,
+                realized_pnl REAL,
+                resolved_at TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+
         # Create indexes
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_market ON orders(market_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
@@ -142,6 +171,8 @@ class DatabaseStorage:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_positions_open ON positions(is_open)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_audits_strategy ON trade_audits(strategy_name)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_audits_edge ON trade_audits(edge_type)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_copy_trades_status ON copy_trades(status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_copy_trades_market ON copy_trades(market_id)")
 
         conn.commit()
         conn.close()
@@ -553,4 +584,171 @@ class DatabaseStorage:
             "total_pnl": row[3] or 0,
             "win_rate": (row[2] / row[0]) if row[0] and row[0] > 0 else 0,
             "by_edge_type": by_edge_type,
+        }
+
+    # Copy trade methods for whale copy trading
+    def save_copy_trade(self, copy_trade: Dict[str, Any]) -> None:
+        """Save a copy trade record.
+
+        Args:
+            copy_trade: Dict with copy trade details
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            INSERT OR REPLACE INTO copy_trades
+            (id, timestamp, mode, whale_wallet, market_id, market_slug,
+             market_question, condition_id, token_id, side, outcome,
+             entry_price, size_usd, shares, whale_size_usd, confidence,
+             signals, status, resolved_outcome, exit_price, realized_pnl,
+             resolved_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            copy_trade.get("id"),
+            copy_trade.get("timestamp"),
+            copy_trade.get("mode", "paper"),
+            copy_trade.get("whale_wallet"),
+            copy_trade.get("market_id"),
+            copy_trade.get("market_slug"),
+            copy_trade.get("market_question"),
+            copy_trade.get("condition_id"),
+            copy_trade.get("token_id"),
+            copy_trade.get("side"),
+            copy_trade.get("outcome"),
+            copy_trade.get("entry_price"),
+            copy_trade.get("size_usd"),
+            copy_trade.get("shares"),
+            copy_trade.get("whale_size_usd"),
+            copy_trade.get("confidence"),
+            json.dumps(copy_trade.get("signals", [])),
+            copy_trade.get("status", "open"),
+            copy_trade.get("resolved_outcome"),
+            copy_trade.get("exit_price"),
+            copy_trade.get("realized_pnl"),
+            copy_trade.get("resolved_at"),
+            copy_trade.get("created_at", datetime.utcnow().isoformat()),
+        ))
+
+        conn.commit()
+        conn.close()
+
+    def get_open_copy_trades(self) -> List[Dict[str, Any]]:
+        """Get all open (unresolved) copy trades."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT * FROM copy_trades WHERE status = 'open' ORDER BY timestamp DESC"
+        )
+        rows = cursor.fetchall()
+        description = cursor.description
+        conn.close()
+
+        cols = [d[0] for d in description]
+        return [dict(zip(cols, row)) for row in rows]
+
+    def get_copy_trades(
+        self,
+        status: Optional[str] = None,
+        limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Get copy trades with optional status filter."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        if status:
+            cursor.execute(
+                "SELECT * FROM copy_trades WHERE status = ? ORDER BY timestamp DESC LIMIT ?",
+                (status, limit)
+            )
+        else:
+            cursor.execute(
+                "SELECT * FROM copy_trades ORDER BY timestamp DESC LIMIT ?",
+                (limit,)
+            )
+
+        rows = cursor.fetchall()
+        description = cursor.description
+        conn.close()
+
+        cols = [d[0] for d in description]
+        return [dict(zip(cols, row)) for row in rows]
+
+    def resolve_copy_trade(
+        self,
+        trade_id: str,
+        resolved_outcome: str,
+        exit_price: float,
+        realized_pnl: float
+    ) -> None:
+        """Mark a copy trade as resolved with P&L.
+
+        Args:
+            trade_id: The copy trade ID
+            resolved_outcome: What the market resolved to (e.g., "Yes", "No")
+            exit_price: The resolution price (1.0 for win, 0.0 for loss)
+            realized_pnl: The realized profit/loss
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            UPDATE copy_trades SET
+                status = 'resolved',
+                resolved_outcome = ?,
+                exit_price = ?,
+                realized_pnl = ?,
+                resolved_at = ?
+            WHERE id = ?
+        """, (
+            resolved_outcome,
+            exit_price,
+            realized_pnl,
+            datetime.utcnow().isoformat(),
+            trade_id,
+        ))
+
+        conn.commit()
+        conn.close()
+
+    def get_copy_trade_summary(self) -> Dict[str, Any]:
+        """Get summary statistics for copy trades."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        # Overall stats
+        cursor.execute("""
+            SELECT
+                COUNT(*) as total_trades,
+                SUM(size_usd) as total_deployed,
+                SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) as open_trades,
+                SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END) as resolved_trades,
+                SUM(CASE WHEN status = 'resolved' AND realized_pnl > 0 THEN 1 ELSE 0 END) as winning_trades,
+                SUM(CASE WHEN status = 'resolved' AND realized_pnl <= 0 THEN 1 ELSE 0 END) as losing_trades,
+                SUM(CASE WHEN status = 'resolved' THEN realized_pnl ELSE 0 END) as total_realized_pnl,
+                AVG(CASE WHEN status = 'resolved' THEN realized_pnl END) as avg_pnl,
+                MAX(CASE WHEN status = 'resolved' THEN realized_pnl END) as max_profit,
+                MIN(CASE WHEN status = 'resolved' THEN realized_pnl END) as max_loss
+            FROM copy_trades
+        """)
+        row = cursor.fetchone()
+        conn.close()
+
+        total = row[0] or 0
+        resolved = row[3] or 0
+        winning = row[4] or 0
+
+        return {
+            "total_trades": total,
+            "total_deployed_usd": row[1] or 0,
+            "open_trades": row[2] or 0,
+            "resolved_trades": resolved,
+            "winning_trades": winning,
+            "losing_trades": row[5] or 0,
+            "win_rate": (winning / resolved) if resolved > 0 else 0,
+            "total_realized_pnl": row[6] or 0,
+            "avg_pnl": row[7] or 0,
+            "max_profit": row[8] or 0,
+            "max_loss": row[9] or 0,
         }

@@ -16,10 +16,16 @@ logger = logging.getLogger(__name__)
 class GammaMarketClient:
     """Client for Polymarket Gamma API."""
 
+    # User-Agent header to identify our bot (prevents blocking)
+    USER_AGENT = "PolymarketBot/1.0 (Copy Trading Research; contact@example.com)"
+
     def __init__(self, settings: Settings):
         """Initialize the Gamma client."""
         self.base_url = settings.gamma_host
-        self._http_client = httpx.Client(timeout=30.0)
+        self._http_client = httpx.Client(
+            timeout=30.0,
+            headers={"User-Agent": self.USER_AGENT}
+        )
 
     def _get(self, endpoint: str, params: Optional[Dict] = None) -> Any:
         """Make GET request to Gamma API."""

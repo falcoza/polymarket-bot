@@ -207,7 +207,7 @@ class Settings(BaseSettings):
     # Whale Scanner Settings (stricter insider detection)
     whale_min_bet_usd: float = Field(
         default=2000.0,
-        description="Minimum bet size to trigger whale alert (lower now, freshness matters more)",
+        description="Floor minimum bet size to trigger whale alert",
     )
     whale_fresh_wallet_days: int = Field(
         default=7,
@@ -221,17 +221,43 @@ class Settings(BaseSettings):
         default=3,
         description="Max unique markets for suspicious wallet (< this = alert)",
     )
-    whale_max_trade_age_hours: int = Field(
+    whale_max_trade_age_minutes: int = Field(
         default=5,
-        description="Only alert on trades younger than this (hours)",
+        description="Only alert on trades younger than this (MINUTES - critical for alpha)",
     )
     whale_scan_interval: int = Field(
-        default=60,
-        description="Seconds between whale scans",
+        default=300,
+        description="Seconds between whale scans (300 = 5 min, prevents API blocking)",
     )
     whale_copy_max_usd: float = Field(
         default=10.0,
         description="Maximum USD per copy trade",
+    )
+
+    # NEW: ROI Improvement Settings
+    whale_max_entry_price: float = Field(
+        default=0.85,
+        description="Skip trades with entry price above this (too little upside)",
+    )
+    whale_min_entry_price: float = Field(
+        default=0.15,
+        description="Skip trades with entry price below this (too little upside)",
+    )
+    whale_min_risk_reward: float = Field(
+        default=0.20,
+        description="Minimum risk/reward ratio (0.20 = 1:5 minimum, works with 0.15-0.85 price range)",
+    )
+    whale_min_confidence: float = Field(
+        default=0.65,
+        description="Minimum confidence score to execute copy (raised from ~0.50)",
+    )
+    whale_min_resolution_hours: float = Field(
+        default=0.5,
+        description="Skip markets with less than this time to resolution (30 min)",
+    )
+    whale_position_scaling: bool = Field(
+        default=True,
+        description="Scale position size based on price distance from 0.50",
     )
 
     # Telegram Settings
